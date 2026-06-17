@@ -106,7 +106,7 @@ def _(mo):
         dump_file="matmul_mlir",
         print_source_ir=False,
         print_transformed_ir=False,
-        print_assembly=True,
+        print_assembly=False,
         shared_lib=True
     )
     module = compiler.compile(sched)
@@ -796,6 +796,8 @@ def _(mo):
     2. Now, set `Tile I` to **64** and `Tile J` to **64**. Click both buttons again.
     
     You should see the **`L1 Bound`** explode in the Topdown L3 chart, and a massive spike of memory operations (`vmovups`, `mov`, etc.) dominating the assembly instruction table! The CPU is drowning in L1 Cache transfers because the micro-tile no longer fits in its physical registers.
+
+    If the tile is way too big, the bottleneck will be reported to **`L2 bound`** then **`L3 bound`** ...
     
     {mo.hstack([btn_l3, btn_asm])}
     """)
@@ -888,33 +890,46 @@ def _(btn_asm, mo, module):
             out = subprocess.check_output(["objdump", "-d", so_path], universal_newlines=True)
 
             counter = Counter()
+            mem_instr = 0
+            math_instr = 0
+            spill_count = 0
+
             for line in out.splitlines():
                 if ":" in line:
                     parts = line.split("\t")
                     if len(parts) >= 3:
-                        mnemonic = parts[2].split()[0]
+                        instr_full = parts[2].strip()
+                        mnemonic = instr_full.split()[0]
+                        operands = instr_full[len(mnemonic):]
+
                         if mnemonic.isalnum(): 
                             counter[mnemonic] += 1
+
+                        if "mov" in mnemonic or "ldr" in mnemonic or "str" in mnemonic:
+                            mem_instr += 1
+                            # Spilling on stack
+                            if "%rsp" in operands or "%rbp" in operands:
+                                spill_count += 1
+                                print(f"[DEBUG] Spill at : {mnemonic} {operands}")
+                        elif "add" in mnemonic or "mul" in mnemonic or "fma" in mnemonic:
+                            math_instr += 1
 
             if not counter:
                 asm_ui = mo.md("*Could not parse assembly instructions from the binary.*")
             else:
                 asm_data = [{"Mnemonic": k, "Occurrences": v} for k, v in counter.most_common(20)]
-
-                mem_instr = sum(v for k, v in counter.items() if "mov" in k or "ldr" in k or "str" in k)
-                math_instr = sum(v for k, v in counter.items() if "add" in k or "mul" in k or "fma" in k)
-                
                 ratio = mem_instr / max(math_instr, 1)
 
-                if ratio > 1.5:
-                    alert = mo.callout(mo.md(f"**High Memory/Math Ratio ({ratio:.1f}x)!** Register spilling is highly likely. The CPU is drowning in `mov`/load/store instructions."), kind="danger")
+                alerts = []
+                # Avoid the absolute value put at the end of the function
+                if spill_count > 1:
+                    alerts.append(mo.callout(mo.md(f"**REGISTER SPILLING DETECTED!** Found **{spill_count}** memory operations hitting the stack (`%rsp` or `%rbp`). The compiler ran out of physical vector registers!"), kind="danger"))
+                elif ratio > 1.5:
+                    alerts.append(mo.callout(mo.md(f"**High Memory Traffic ({ratio:.1f}x).** No stack spills detected, but the loop is drowning in memory operations. The compiler probably failed to keep the accumulator matrix 'C' in registers (missing Load/Store Hoisting)."), kind="warn"))
                 else:
-                    alert = mo.callout(mo.md(f"**Healthy Memory/Math Ratio ({ratio:.1f}x).** Accumulators are efficiently kept in registers."), kind="success")
+                    alerts.append(mo.callout(mo.md(f"**Healthy Memory/Math Ratio ({ratio:.1f}x).** Accumulators are efficiently kept in registers."), kind="success"))
 
-                asm_ui = mo.vstack([
-                    alert,
-                    mo.ui.table(asm_data, label="Top 20 Instructions")
-                ])
+                asm_ui = mo.vstack(alerts + [mo.ui.table(asm_data, label="Top 20 Instructions")])
 
         except Exception as e:
             asm_ui = mo.md(f"*Failed to run objdump: {e}*")
