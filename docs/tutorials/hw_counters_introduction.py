@@ -325,8 +325,9 @@ def _(btn_l1, exec_error, mo, module, platform):
                  _l1_ui_display = mo.accordion({"Arch not supported or hardware counters not activated. Fallback to `perf stat` output": mo.md(f"```text\n{error_l1}\n```")})
             else:
                 _l1_data = [{"Category": l, "Percentage (%)": round(v, 2)} for l, v in zip(_l1_labels, results_l1)]
+                _l1_data.sort(key=lambda x: x["Percentage (%)"], reverse=True)
                 _l1_ui_table = mo.ui.table(_l1_data, label="Topdown L1 Results")
-
+                
                 try:
                     import altair as alt
 
@@ -341,7 +342,8 @@ def _(btn_l1, exec_error, mo, module, platform):
                             ),
                             legend=alt.Legend(title="Bottlenecks")
                         ),
-                        tooltip=["Category:N", "Percentage (%):Q"]
+                        tooltip=["Category:N", "Percentage (%):Q"],
+                        order=alt.Order("Percentage (%):Q", sort="descending"),
                     ).properties(width=300, height=300, title="TMA L1 Breakdown")
 
                     _l1_ui_display = mo.hstack([_l1_ui_table, mo.ui.altair_chart(_chart)], justify="start", gap=4)
@@ -433,8 +435,8 @@ def _(btn_l2, exec_error, mo, module, platform):
                  ])
             else:
                 _l2_data = [{"Sub-Category": l, "Percentage (%)": round(v, 2)} for l, v in zip(_l2_labels, results_l2)]
+                _l2_data.sort(key=lambda x: x["Percentage (%)"], reverse=True)
                 _l2_ui_table = mo.ui.table(_l2_data, label="Topdown L2 Results")
-
                 try:
                     import altair as alt2
 
@@ -454,7 +456,8 @@ def _(btn_l2, exec_error, mo, module, platform):
                             ),
                             legend=alt2.Legend(title="Sub-Bottlenecks")
                         ),
-                        tooltip=["Sub-Category:N", "Percentage (%):Q"]
+                        tooltip=["Sub-Category:N", "Percentage (%):Q"],
+                        order=alt2.Order("Percentage (%):Q", sort="descending")
                     ).properties(width=350, height=300, title="TMA L2 Breakdown")
 
                     _l2_ui_display = mo.hstack([_l2_ui_table, mo.ui.altair_chart(_chart)], justify="start", gap=4)
@@ -838,6 +841,7 @@ def _(btn_l3, exec_error, mo, module, platform):
                 if _other_sum > 0:
                     _l3_data.append({"Metric": "Others (<1%)", "Percentage (%)": round(_other_sum, 2)})
 
+                _l3_data.sort(key=lambda x: x["Percentage (%)"], reverse=True)
                 _l3_ui_table = mo.ui.table(_l3_data, label="Topdown L3 (Metrics >1%)")
 
                 try:
@@ -851,6 +855,7 @@ def _(btn_l3, exec_error, mo, module, platform):
                     _chart = alt3.Chart(alt3.Data(values=_l3_data)).mark_arc(innerRadius=40).encode(
                         theta=alt3.Theta(field="Percentage (%)", type="quantitative"),
                         color=color_condition,
+                        order=alt3.Order("Percentage (%):Q", sort="descending"),
                         tooltip=["Metric:N", "Percentage (%):Q"]
                     ).properties(width=350, height=300, title="TMA L3 Breakdown")
 
