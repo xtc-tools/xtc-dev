@@ -333,7 +333,14 @@ def _(mo, platform, plot_upipe):
         if so_path:
             try:
                 # Silently dump the assembly to a Python string
+                MAX_ASM_OUTPUT = 50000
                 asm_code = subprocess.check_output(["objdump", "--disassemble=matmul", so_path], universal_newlines=True)
+                raw_asm_len = asm_code.__len__() 
+                if raw_asm_len > MAX_ASM_OUTPUT: 
+                    print(f"[DEBUG] asm_code.__len__() = {raw_asm_len}")
+                    asm_code = asm_code[:MAX_ASM_OUTPUT]
+                    asm_code += f"... output troncatured ({raw_asm_len}/{MAX_ASM_OUTPUT} bytes"
+                    
             except Exception as e:
                 asm_code = f"Failed to extract assembly: {e}"
 
