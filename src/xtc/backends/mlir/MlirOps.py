@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from typing_extensions import override
 from typing import Any, Type, TypeAlias, cast
 
-from xdsl.dialects import linalg, arith, builtin, memref, tensor, scf
+from xdsl.dialects import linalg, arith, builtin, memref, tensor, scf, affine
 from xdsl.dialects.builtin import (
     MemRefType,
     TensorType,
@@ -19,7 +19,7 @@ from xdsl.dialects.builtin import (
     StringAttr,
     AffineMapAttr,
 )
-from xdsl.ir import Block, BlockArgument, Region
+from xdsl.ir import Block, BlockArgument, Region, SSAValue
 from xdsl.ir.affine import AffineMap
 from xdsl.irdl import irdl_op_definition
 from xdsl.builder import ImplicitBuilder
@@ -190,6 +190,13 @@ class MlirOperatorMatmul(MlirOperator):
     def generate_op(
         self, block: Block | None = None, args: Sequence[BlockArgument] = []
     ) -> tuple[Block, OpAttrs]:
+        if self.attrs.get("emit_affine"):
+            return self._generate_op_affine(block, args)
+        return self._generate_op_linalg(block, args)
+
+    def _generate_op_linalg(
+        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+    ) -> tuple[Block, OpAttrs]:
         Ki, Kj, Kk, dtype, transpose_a, transpose_b = self.args
         elt_type = {"float32": f32, "float64": f64}[dtype]
         elt_size = {"float32": 32, "float64": 64}[dtype]
@@ -265,6 +272,125 @@ class MlirOperatorMatmul(MlirOperator):
                 {"i": Ki, "j": Kj},
                 self.dims_sizes(),
             ],
+            "output_nodes": [reduce],
+        }
+        return block, attrs
+
+    def _generate_op_affine(
+        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+    ) -> tuple[Block, OpAttrs]:
+        """Emit matmul as nested affine.for over tensors (extract/insert + iter_args)."""
+        Ki, Kj, Kk, dtype, transpose_a, transpose_b = self.args
+        elt_type = {"float32": f32, "float64": f64}[dtype]
+        elt_size = {"float32": 32, "float64": 64}[dtype]
+
+        if self.op_type is not TensorType:
+            raise NotImplementedError(
+                "emit_affine matmul currently requires tensor dialect "
+                "(use_tensor_dialect=True); memref affine emission is not implemented yet"
+            )
+        if transpose_a or transpose_b:
+            raise NotImplementedError(
+                "emit_affine matmul does not support transposed layouts yet"
+            )
+
+        if block is None:
+            ops_types = [
+                TensorType(elt_type, shape)
+                for shape in [[Ki, Kk], [Kk, Kj], [Ki, Kj]]
+            ]
+            block = Block(arg_types=ops_types)
+            args = block.args
+        assert len(args) == 3
+        assert all(isinstance(arg.type, TensorType) for arg in args)
+
+        a, b, c_init = args
+        c_type = cast(TensorType, c_init.type)
+
+        map_a = AffineMap.from_callable(lambda i, j, k: (i, k))
+        map_b = AffineMap.from_callable(lambda i, j, k: (k, j))
+        map_c = AffineMap.from_callable(lambda i, j, k: (i, j))
+        map_c_2d = AffineMap.from_callable(lambda i, j: (i, j))
+
+        def affine_indices(amap: AffineMap, ivs: Sequence[SSAValue]) -> list[SSAValue]:
+            idxs: list[SSAValue] = []
+            for expr in amap.results:
+                proj = AffineMap(amap.num_dims, amap.num_symbols, (expr,))
+                idxs.append(
+                    affine.ApplyOp(ivs, AffineMapAttr(proj)).results[0]
+                )
+            return idxs
+
+        def affine_for(
+            upper: int,
+            init: SSAValue,
+            body_fn: Any,
+        ) -> affine.ForOp:
+            body = Block(arg_types=[IndexType(), c_type])
+            with ImplicitBuilder(body):
+                affine.YieldOp.get(body_fn(body.args[0], body.args[1]))
+            return affine.ForOp.from_region(
+                [],
+                [],
+                [init],
+                [c_type],
+                0,
+                upper,
+                Region([body]),
+                1,
+            )
+
+        with ImplicitBuilder(block):
+            cst0 = arith.ConstantOp(builtin.FloatAttr(0, elt_size))
+
+            def fill_i_body(i: SSAValue, c_i: SSAValue) -> SSAValue:
+                def fill_j_body(j: SSAValue, c_ij: SSAValue) -> SSAValue:
+                    return tensor.InsertOp(
+                        cst0.results[0],
+                        c_ij,
+                        affine_indices(map_c_2d, [i, j]),
+                    ).results[0]
+
+                return affine_for(Kj, c_i, fill_j_body).results[0]
+
+            fill = affine_for(Ki, c_init, fill_i_body)
+
+            def reduce_i_body(i: SSAValue, c_i: SSAValue) -> SSAValue:
+                def reduce_j_body(j: SSAValue, c_j: SSAValue) -> SSAValue:
+                    def reduce_k_body(k: SSAValue, c_cur: SSAValue) -> SSAValue:
+                        ivs = [i, j, k]
+                        va = tensor.ExtractOp(
+                            a, affine_indices(map_a, ivs), elt_type
+                        ).results[0]
+                        vb = tensor.ExtractOp(
+                            b, affine_indices(map_b, ivs), elt_type
+                        ).results[0]
+                        vc = tensor.ExtractOp(
+                            c_cur, affine_indices(map_c, ivs), elt_type
+                        ).results[0]
+                        mul = arith.MulfOp(va, vb)
+                        add = arith.AddfOp(vc, mul)
+                        return tensor.InsertOp(
+                            add.results[0],
+                            c_cur,
+                            affine_indices(map_c, ivs),
+                        ).results[0]
+
+                    return affine_for(Kk, c_j, reduce_k_body).results[0]
+
+                return affine_for(Kj, c_i, reduce_j_body).results[0]
+
+            reduce = affine_for(Ki, fill.results[0], reduce_i_body)
+
+        fill_node_id = f"{self.name}_0"
+        reduce_node_id = f"{self.name}"
+        fill.attributes[f"__xtc_id_{fill_node_id}_"] = UnitAttr()
+        reduce.attributes[f"__xtc_id_{reduce_node_id}_"] = UnitAttr()
+        # Empty nodes_map: affine nests are not linalg-tilable; skip transform dialect
+        # scheduling until affine-aware transforms exist.
+        attrs = {
+            "nodes_map": {},
+            "dims_sizes": [],
             "output_nodes": [reduce],
         }
         return block, attrs

@@ -38,6 +38,14 @@ class MlirGraphBackend(MlirBackend):
         no_alias: bool = True,
         use_tensor_dialect: bool = False,
     ):
+        # Affine emission is tensor-first; auto-enable tensor dialect when any
+        # node requests emit_affine, without changing the linalg/memref default.
+        if isinstance(xdsl_func, XTCGraph) and not use_tensor_dialect:
+            if any(
+                bool(node.operation.attrs.get("emit_affine"))
+                for node in xdsl_func.nodes.values()
+            ):
+                use_tensor_dialect = True
         self.xdsl_type: Type[TensorType] | Type[MemRefType] = (
             TensorType if use_tensor_dialect else MemRefType
         )

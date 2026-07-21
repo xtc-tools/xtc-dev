@@ -790,10 +790,13 @@ def apply_bufferization_passes(mlir_program: RawMlirProgram, mlir_install_dir: s
         "buffer-alignment=256",
     ]
     # run the remaining passes with passmanager for newer llvm version
+    # lower-affine before bufferize: affine.for with tensor iter_args is not
+    # bufferized by one-shot-bufferize; scf.for is.
     MlirProgramApplyPasses(mlir_program).run(
         [
             "canonicalize",
             "cse",
+            "func.func(lower-affine)",
             "eliminate-empty-tensors",  # causes ops to write directly to out buffer
             f"one-shot-bufferize{{{' '.join(bufferize_options)}}}",
             "drop-equivalent-buffer-results",
