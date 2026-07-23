@@ -5,11 +5,15 @@
 #
 
 import argparse
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
-from xdsl.dialects import func, builtin
+from mlir.ir import Context as MlirContext
+from mlir.ir import Module as MlirModule
+from xdsl.dialects import affine, func, builtin
 from xdsl.ir import Operation
+from xdsl.utils.exceptions import ParseError
 
 from xtc.itf.schd.scheduler import Scheduler
 from xtc.schedules.descript import descript_scheduler
@@ -25,7 +29,7 @@ def main():
     with open(args.filename, "r") as f:
         source = f.read()
 
-    module = parse_xdsl_module(source)
+    module = parse_mlir_loop_module(source)
     # Extract the only function of the module (or fail)
     myfunc = None
     for o in module.walk():
@@ -34,9 +38,7 @@ def main():
             myfunc = o
     assert myfunc
     # Identify the scheduled operations
-    ops_to_schedule = [
-        op for op in myfunc.walk() if any("loop." in attr for attr in op.attributes)
-    ]
+    ops_to_schedule = [op for op in myfunc.walk() if "loop.dims" in op.attributes]
 
     # Build the transform script
     schedulers: list[Scheduler] = []
@@ -144,6 +146,74 @@ def build_node_scheduler(
     return scheduler
 
 
+def parse_mlir_loop_module(source: str) -> builtin.ModuleOp:
+    try:
+        return parse_xdsl_module(source)
+    except ParseError:
+        if "affine." not in source:
+            raise
+        # xDSL's affine dialect currently only supports generic assembly.
+        with MlirContext() as context:
+            module = MlirModule.parse(source, context=context)
+            generic_source = module.operation.get_asm(print_generic_op_form=True)
+        assert isinstance(generic_source, str)
+        module = parse_xdsl_module(generic_source)
+        _restore_schedule_order(module, _extract_schedule_orders(source))
+        return module
+
+
+def _extract_schedule_orders(source: str) -> list[list[str]]:
+    orders = []
+    for match in re.finditer(r"loop\.schedule\s*=\s*\{", source):
+        order = []
+        depth = 1
+        index = match.end()
+        while depth:
+            if index >= len(source):
+                raise ValueError("Unterminated loop.schedule attribute")
+            char = source[index]
+            if char == '"':
+                end = index + 1
+                while end < len(source):
+                    if source[end] == '"' and source[end - 1] != "\\":
+                        break
+                    end += 1
+                if end >= len(source):
+                    raise ValueError("Unterminated string in loop.schedule")
+                if depth == 1:
+                    order.append(source[index + 1 : end])
+                index = end + 1
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            index += 1
+        orders.append(order)
+    return orders
+
+
+def _restore_schedule_order(
+    module: builtin.ModuleOp, schedule_orders: list[list[str]]
+) -> None:
+    scheduled_ops = [
+        op
+        for op in module.walk()
+        if isinstance(op.attributes.get("loop.schedule"), builtin.DictionaryAttr)
+    ]
+    if len(scheduled_ops) != len(schedule_orders):
+        raise ValueError("Could not associate loop.schedule attributes with operations")
+
+    for op, order in zip(scheduled_ops, schedule_orders):
+        schedule = op.attributes["loop.schedule"]
+        assert isinstance(schedule, builtin.DictionaryAttr)
+        if set(order) != set(schedule.data):
+            raise ValueError("Parsed loop.schedule declarations do not match source")
+        op.attributes["loop.schedule"] = builtin.DictionaryAttr(
+            {declaration: schedule.data[declaration] for declaration in order}
+        )
+
+
 def normalize_schedule(
     raw_schedule: builtin.DictionaryAttr,
 ) -> dict[str, dict]:
@@ -169,7 +239,7 @@ def normalize_schedule(
                     elif isinstance(param, builtin.IntegerAttr):
                         annotations[instr] = param.value.data
                     else:
-                        raise Exception(f"Annotation parameter should be void or int.")
+                        raise Exception("Annotation parameter should be void or int.")
 
             elif not isinstance(val, builtin.UnitAttr):
                 raise Exception(
@@ -192,6 +262,8 @@ def build_mlir_node_backend(
     if not dims:
         raise Exception("Missing loop.dims attribute")
     op.attributes.pop("loop.dims", None)
+    if isinstance(op, affine.ForOp):
+        validate_affine_loop_nest(op, dims)
     # Additional attributes
     loop_stamps = get_string_list_attribute(op, "loop.add_attributes")
 
@@ -205,6 +277,36 @@ def build_mlir_node_backend(
         no_alias=no_alias,
         id=node_name,
     )
+
+
+def validate_affine_loop_nest(root: affine.ForOp, dims: list[str]) -> None:
+    if isinstance(root.parent_op(), affine.ForOp):
+        raise Exception(
+            "An affine schedule must be attached to the outermost affine.for"
+        )
+
+    loop = root
+    for index, dim in enumerate(dims):
+        nested_loops = [
+            op for op in loop.body.block.ops if isinstance(op, affine.ForOp)
+        ]
+        if index == len(dims) - 1:
+            if nested_loops:
+                raise Exception(
+                    "The number of loop.dims entries must match the affine.for "
+                    "nest depth"
+                )
+            break
+
+        body_ops = [
+            op for op in loop.body.block.ops if not isinstance(op, affine.YieldOp)
+        ]
+        if len(nested_loops) != 1 or body_ops != nested_loops:
+            raise Exception(
+                "Affine scheduling currently requires a perfect affine.for nest; "
+                f"could not resolve dimension {dims[index + 1]} after {dim}"
+            )
+        loop = nested_loops[0]
 
 
 def get_string_list_attribute(op: Operation, attr_name: str) -> list[str]:

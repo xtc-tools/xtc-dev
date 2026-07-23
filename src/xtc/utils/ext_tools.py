@@ -3,15 +3,10 @@
 # Copyright (c) 2024-2026 The XTC Project Authors
 #
 import ctypes.util
-import subprocess
-import re
-import platform
-
 import os
 import platform
-import ctypes.util
-import subprocess
 import re
+import subprocess
 
 
 def get_library_path(libname: str) -> str:
@@ -58,7 +53,7 @@ llc_opts = [
     "-filetype=obj",
 ]
 
-opt_opts = ["-O3", "--enable-unsafe-fp-math", "--fp-contract=fast"]
+opt_opts = ["-O3", "--fp-contract=fast"]
 
 target_cc_opts = ["-O3", "-ffast-math", "-ffp-contract=fast"]
 

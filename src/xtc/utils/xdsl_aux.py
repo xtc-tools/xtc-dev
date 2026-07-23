@@ -11,6 +11,7 @@ from xdsl.ir import (
     SSAValue,
 )
 from xdsl.dialects.arith import ConstantOp
+from xdsl.dialects import builtin
 from xdsl.dialects.builtin import (
     MemRefType,
     TensorType,
@@ -21,14 +22,16 @@ from xdsl.dialects.builtin import (
 
 from xdsl.context import Context
 from xdsl.parser import Parser
-from xdsl.dialects import func, linalg, arith, memref, tensor
+from xdsl.dialects import affine, linalg, arith, memref, tensor
 from xdsl.dialects.builtin import ModuleOp
 from typing import Any, cast
 
 
 def parse_xdsl_module(source: str) -> ModuleOp:
     context = Context()
+    context.load_dialect(builtin.Builtin)
     context.load_dialect(func.Func)
+    context.load_dialect(affine.Affine)
     context.load_dialect(linalg.Linalg)
     context.load_dialect(arith.Arith)
     context.load_dialect(memref.MemRef)

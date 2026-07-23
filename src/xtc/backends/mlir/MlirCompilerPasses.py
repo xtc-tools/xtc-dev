@@ -26,14 +26,23 @@ from mlir.dialects.transform.structured import (
 from mlir.dialects.transform.loop import loop_unroll
 from mlir.dialects.transform import SplitHandleOp
 from mlir.ir import (
+    DenseI64ArrayAttr,
     Location,
     InsertionPoint,
+    Operation,
+    Type,
     UnitAttr,
     OpResult,
 )
 from mlir.passmanager import PassManager
 from mlir.ir import Module
 import subprocess
+from xdsl.context import Context as XdslContext
+from xdsl.dialects import builtin as xdsl_builtin
+from xdsl.dialects.builtin import StringAttr as XdslStringAttr
+from xdsl.parser import Parser as XdslParser
+
+from mlir.dialects.transform import affine as affine_transform
 
 # Import SDist if available
 try:
@@ -218,21 +227,37 @@ class MlirProgramInsertTransformPass:
         for schedule in self._nodes_schedules:
             if schedule.node_ident in unscheduled_handles:
                 continue
+            affine_schedule = self._is_affine_schedule(schedule)
+            if affine_schedule:
+                self._validate_affine_schedule(schedule)
             self._create_sdist_meshes(schedule)
             handle = structured_match(
-                results_=transform.AnyOpType.get(),
+                results_=(
+                    Type.parse('!transform.op<"affine.for">')
+                    if affine_schedule
+                    else transform.AnyOpType.get()
+                ),
                 target=self._named_sequence.bodyTarget,
                 op_attrs={schedule.node_ident: UnitAttr.get()},
             )
 
             if schedule.permutation:
-                scheduling_state = self._generate_node_scheduling(
-                    schedule=schedule,
-                    root=list(schedule.permutation)[0],
-                    handle=handle,
-                    fuse_axes=fused_producers.get(schedule.node_ident),
-                )
-                if schedule.vectorization or self._always_vectorize:
+                if affine_schedule:
+                    scheduling_state = self._generate_affine_node_scheduling(
+                        schedule=schedule,
+                        root=list(schedule.permutation)[0],
+                        handle=handle,
+                    )
+                else:
+                    scheduling_state = self._generate_node_scheduling(
+                        schedule=schedule,
+                        root=list(schedule.permutation)[0],
+                        handle=handle,
+                        fuse_axes=fused_producers.get(schedule.node_ident),
+                    )
+                if not affine_schedule and (
+                    schedule.vectorization or self._always_vectorize
+                ):
                     self._post_vectorize(scheduling_state, schedule)
                 handle = scheduling_state.handle
 
@@ -324,7 +349,9 @@ class MlirProgramInsertTransformPass:
                 continue
             elif split_state.if_last_chunk(loop_name):
                 self._recursive_scheduling(
-                    schedule=schedule, root=loop_name, sched_state=sched_state
+                    schedule=schedule,
+                    root=loop_name,
+                    sched_state=sched_state,
                 )
                 continue
             axis_split = split_state.loop_dim_by_split.get(root)
@@ -374,6 +401,129 @@ class MlirProgramInsertTransformPass:
             self._unroll(permutation, schedule, sched_state)
 
         return sched_state
+
+    def _generate_affine_node_scheduling(
+        self,
+        schedule: MlirNodeSchedule,
+        root: str,
+        handle: OpResult,
+    ) -> SchedulingState:
+        assert self._named_sequence is not None
+        sched_state = SchedulingState({}, handle, None)
+        permutation = schedule.permutation[root]
+        (
+            point_loop_names,
+            tile_loop_names,
+            dimensions,
+            tile_sizes,
+            point_dimensions,
+        ) = self._affine_tile_spec(schedule, root)
+
+        affine_for_type = Type.parse('!transform.op<"affine.for">')
+        tiling = affine_transform.TileOp(
+            handle, dimensions, tile_sizes, point_dimensions=point_dimensions
+        )
+
+        split_tiles = SplitHandleOp(
+            results_=[affine_for_type] * len(tile_loop_names),
+            handle=tiling.tile_loops,
+            fail_on_payload_too_small=True,
+        )
+        for loop_name, loop in zip(tile_loop_names, split_tiles.results):
+            sched_state.all_loops[loop_name] = loop
+            transform.AnnotateOp(loop, loop_name)
+
+        split_points = SplitHandleOp(
+            results_=[affine_for_type] * len(schedule.dims),
+            handle=tiling.point_loops,
+            fail_on_payload_too_small=True,
+        )
+        point_band_name = f"{schedule.node_ident}_point_band"
+        transform.AnnotateOp(
+            split_points.results[point_dimensions[0]], point_band_name
+        )
+        for dim, loop in zip(schedule.dims, split_points.results):
+            loop_name = point_loop_names[dim]
+            if loop_name is None:
+                continue
+            sched_state.all_loops[loop_name] = loop
+            transform.AnnotateOp(loop, loop_name)
+
+        sched_state.handle = split_tiles.results[0]
+        if schedule.unrolling:
+            self._unroll(permutation, schedule, sched_state)
+        if schedule.parallelization:
+            self._parallelize_affine(permutation, schedule, sched_state)
+        if schedule.vectorization:
+            vector_loop = schedule.vectorization[0]
+            point_bands = structured_match(
+                results_=affine_for_type,
+                target=self._named_sequence.bodyTarget,
+                op_attrs={point_band_name: UnitAttr.get()},
+            )
+            vectorized_loops = structured_match(
+                results_=affine_for_type,
+                target=self._named_sequence.bodyTarget,
+                op_attrs={vector_loop: UnitAttr.get()},
+            )
+            vector_size = schedule.size_of_tile(vector_loop)
+            affine_transform.AffineVectorizeOp(
+                point_bands,
+                vectorized_loops,
+                vector_sizes=DenseI64ArrayAttr.get([vector_size])
+                if vector_size is not None
+                else None,
+            )
+            sched_state.handle = self._named_sequence.bodyTarget
+
+        return sched_state
+
+    @staticmethod
+    def _affine_tile_spec(
+        schedule: MlirNodeSchedule, root: str
+    ) -> tuple[dict[str, str | None], list[str], list[int], list[int], list[int]]:
+        permutation = schedule.permutation[root]
+        # Vectorization consumes the residual point loop. Every preceding level
+        # is materialized in the ordered tile-space prefix, as in the linalg path.
+        point_loop_names: dict[str, str | None] = {
+            dim: None for dim in schedule.dims
+        }
+        for loop_name in schedule.vectorization:
+            point_loop_names[schedule.dim_of_tile(loop_name)] = loop_name
+        tile_loop_names = [
+            loop_name
+            for loop_name in permutation
+            if loop_name not in schedule.vectorization
+        ]
+        dimensions = [
+            schedule.index_of_dim(schedule.dim_of_tile(loop_name))
+            for loop_name in tile_loop_names
+        ]
+        tile_sizes = []
+        for loop_name in tile_loop_names:
+            dim = schedule.dim_of_tile(loop_name)
+            levels = [make_loop_name(root, dim), *schedule.tiles[dim]]
+            next_level = levels[levels.index(loop_name) + 1 :]
+            tile_size = schedule.size_of_tile(next_level[0]) if next_level else 1
+            assert tile_size is not None
+            tile_sizes.append(tile_size)
+
+        vectorized_dims = [
+            schedule.dim_of_tile(loop_name)
+            for loop_name in schedule.vectorization
+        ]
+        point_order = [
+            dim for dim in schedule.dims if dim not in vectorized_dims
+        ] + vectorized_dims
+        point_dimensions = [schedule.index_of_dim(dim) for dim in point_order]
+
+        return (
+            point_loop_names,
+            tile_loop_names,
+            dimensions,
+            tile_sizes,
+            point_dimensions,
+        )
 
     def _fuse_producers_into_loop(
         self,
@@ -482,10 +632,16 @@ class MlirProgramInsertTransformPass:
         split_state.move_forward(loop_name)
 
     def _recursive_scheduling(
-        self, schedule: MlirNodeSchedule, root: str, sched_state: SchedulingState
+        self,
+        schedule: MlirNodeSchedule,
+        root: str,
+        sched_state: SchedulingState,
     ):
         inner_sched_state = self._generate_node_scheduling(
-            schedule=schedule, root=root, handle=sched_state.handle, fuse_axes=None
+            schedule=schedule,
+            root=root,
+            handle=sched_state.handle,
+            fuse_axes=None,
         )
         sched_state.all_loops.update(inner_sched_state.all_loops)
         sched_state.handle = inner_sched_state.handle
@@ -512,6 +668,56 @@ class MlirProgramInsertTransformPass:
         transform.AnnotateOp(new_loop, loop_name)
 
         return new_loop
+
+    def _parallelize_affine(
+        self,
+        permutation: list[str],
+        schedule: MlirNodeSchedule,
+        sched_state: SchedulingState,
+    ) -> None:
+        for loop_name in reversed(permutation):
+            if loop_name not in schedule.parallelization:
+                continue
+            parallelize = affine_transform.ParallelizeOp(
+                sched_state.all_loops[loop_name]
+            )
+            sched_state.all_loops[loop_name] = parallelize.result
+
+        sched_state.handle = next(iter(sched_state.all_loops.values()))
+
+    def _is_affine_schedule(self, schedule: MlirNodeSchedule) -> bool:
+        for op in self._walk_operations(self._mlir_program.mlir_module.operation):
+            if schedule.node_ident in op.attributes:
+                return op.name == "affine.for"
+        return False
+
+    @staticmethod
+    def _walk_operations(op: Operation):
+        yield op
+        for region in op.regions:
+            for block in region.blocks:
+                for nested_op in block.operations:
+                    yield from MlirProgramInsertTransformPass._walk_operations(
+                        nested_op
+                    )
+
+    @staticmethod
+    def _validate_affine_schedule(schedule: MlirNodeSchedule) -> None:
+        unsupported = []
+        if schedule.splits:
+            unsupported.append("split")
+        if schedule.fused:
+            unsupported.append("fusion")
+        if schedule.packed_buffers:
+            unsupported.append("packing")
+        if schedule.distributed_buffers or schedule.distribution:
+            unsupported.append("distribution")
+        if schedule.memory_mesh or schedule.processor_mesh:
+            unsupported.append("meshes")
+        if unsupported:
+            raise ValueError(
+                "Affine schedules do not yet support: " + ", ".join(unsupported)
+            )
 
     def _vectorize(self, sched_state: SchedulingState):
         if self._vectors_size is not None:
@@ -707,10 +913,12 @@ class MlirProgramApplyTransformPass:
         mlir_program: RawMlirProgram,
         clean_all: bool = False,
         custom_sequence: None | str = None,
+        mlir_install_dir: str | None = None,
     ) -> None:
         self._mlir_program = mlir_program
         self._clean_all = clean_all
         self._custom_sequence = custom_sequence
+        self._mlir_install_dir = mlir_install_dir
 
     def run(self) -> None:
         transform_op = [op for op in self._mlir_program.mlir_module.body.operations][-1]
