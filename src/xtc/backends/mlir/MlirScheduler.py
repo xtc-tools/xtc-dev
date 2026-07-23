@@ -48,6 +48,14 @@ class MlirScheduler(itf.schd.Scheduler):
             # Take last node or find default_node
             if default_node is None:
                 candidate_nodes = self._nodes_schedulers
+                if backend.default_node is not None:
+                    backend_candidate_nodes = [
+                        scheduler
+                        for scheduler in self._nodes_schedulers
+                        if scheduler._current_scheduler.node_name == backend.default_node
+                    ]
+                    if backend_candidate_nodes:
+                        candidate_nodes = backend_candidate_nodes
             else:
                 candidate_nodes = [
                     scheduler

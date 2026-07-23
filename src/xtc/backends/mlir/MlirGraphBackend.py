@@ -52,13 +52,14 @@ class MlirGraphBackend(MlirBackend):
         if isinstance(xdsl_func, XTCGraph):
             assert nodes is None
             graph = xdsl_func
-            function, nodes_dict = self._init_from_graph(graph)
+            function, nodes_dict, default_node = self._init_from_graph(graph)
         else:
             assert isinstance(xdsl_func, xdslFuncOp)
             assert nodes is not None
             graph = None
-            function, nodes_dict = self._init_from_xdsl(xdsl_func, nodes)
+            (function, nodes_dict), default_node = self._init_from_xdsl(xdsl_func, nodes), None
         self.nodes = nodes_dict
+        self.default_node = default_node
         super().__init__(
             xdsl_func=function,
             always_vectorize=always_vectorize,
@@ -124,7 +125,7 @@ class MlirGraphBackend(MlirBackend):
         concluding_passes: list[str] = [],
         always_vectorize: bool = True,
         no_alias: bool = False,
-    ) -> tuple[xdslFuncOp, dict[str, MlirNodeBackend]]:
+    ) -> tuple[xdslFuncOp, dict[str, MlirNodeBackend], str]:
         inputs_types = graph.inputs_types
         outputs_types = graph.outputs_types
         assert inputs_types is not None and outputs_types is not None, (
@@ -179,7 +180,9 @@ class MlirGraphBackend(MlirBackend):
             arg_attrs=arg_attrs,
         )
         nodes_dict = {}
+        default_node = None
         for attrs in block_attrs:
+            default_node = attrs["nodes_map"].get("root_node")
             for (node_id, node), dims in zip(
                 attrs["nodes_map"].items(), attrs["dims_sizes"]
             ):
@@ -193,7 +196,7 @@ class MlirGraphBackend(MlirBackend):
                     id=f"__xtc_id_{node_id}_",
                     xdsl_type=self.xdsl_type,
                 )
-        return payload, nodes_dict
+        return payload, nodes_dict, default_node
 
     def _xdsl_elt_shape_from_tensortype(self, type: XTCTensorType) -> tuple[Any, Any]:
         elt_type = {"float32": f32, "float64": f64}[type.constant_dtype]
