@@ -28,6 +28,8 @@ from xtc.itf.graph import Operation
 from xtc.graphs.xtc.data import XTCTensorType
 from xtc.utils.math import mulall
 
+from .MlirEmit import Axis, OpDesc, TensorDesc, emit_op, resolve_epilogue
+
 
 __all__ = [
     "MlirOperation",
@@ -67,7 +69,7 @@ class MlirOperation:
         self.name = self.operator.name if name is None else name
 
     def generate(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
         return self.operator.generate_op(block, args)
 
@@ -135,7 +137,7 @@ class MlirOperator(ABC):
 
     @abstractmethod
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]: ...
     @abstractmethod
     def dims(self, kind: str = "") -> tuple[str, ...]: ...
@@ -188,22 +190,65 @@ class MlirOperatorMatmul(MlirOperator):
 
     @override
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
-        if self.attrs.get("emit_affine"):
-            return self._generate_op_affine(block, args)
-        return self._generate_op_linalg(block, args)
+        use_emit = (
+            self.attrs.get("emit_from_desc")
+            or self.attrs.get("emit_affine")
+            or self.attrs.get("epilogue")
+        )
+        if use_emit:
+            _, _, _, dtype, transpose_a, transpose_b = self.args
+            emit_dialect = "affine" if self.attrs.get("emit_affine") else "linalg"
+            epilogue_body = resolve_epilogue(self.attrs.get("epilogue"), dtype)
 
-    def _generate_op_linalg(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
-    ) -> tuple[Block, OpAttrs]:
+            # Axes mirror AXES/KINDS so the OpDesc cannot drift from the scheduler's view.
+            axis_sizes = self.dims_sizes()
+            axes = tuple(
+                Axis(name, axis_sizes[name], kind)
+                for name, kind in zip(self.AXES, self.KINDS)
+            )
+            # Transposed layouts only swap the tensor shape and its access map.
+            dims_a, dims_b = self.inputs_dims()
+            index_map_a = (
+                (lambda i, j, k: (k, i)) if transpose_a else (lambda i, j, k: (i, k))
+            )
+            index_map_b = (
+                (lambda i, j, k: (j, k)) if transpose_b else (lambda i, j, k: (k, j))
+            )
+            op_desc = OpDesc(
+                name=self.name,
+                axes=axes,
+                inputs=(
+                    TensorDesc("A", dims_a, dtype, index_map_a),
+                    TensorDesc("B", dims_b, dtype, index_map_b),
+                ),
+                output=TensorDesc(
+                    "C", self.outputs_dims()[0], dtype, lambda i, j, k: (i, j)
+                ),
+                body=lambda input_elements, accumulator: arith.AddfOp(
+                    accumulator,
+                    arith.MulfOp(input_elements[0], input_elements[1]),
+                ).results[0],
+                init=0.0,
+                epilogue=epilogue_body,
+            )
+            return emit_op(
+                op_desc,
+                dialect=emit_dialect,
+                block=block,
+                args=args,
+                op_type=self.op_type,
+            )
+
+        # Default legacy linalg implementation
         Ki, Kj, Kk, dtype, transpose_a, transpose_b = self.args
         elt_type = {"float32": f32, "float64": f64}[dtype]
         elt_size = {"float32": 32, "float64": 64}[dtype]
         if block is None:
             ops_types = [
                 self.op_type(elt_type, shape)
-                for shape in [[Ki, Kk], [Kk, Kj], [Ki, Kj]]
+                for shape in [*self.inputs_dims(), *self.outputs_dims()]
             ]
             block = Block(arg_types=ops_types)
             args = block.args
@@ -273,132 +318,16 @@ class MlirOperatorMatmul(MlirOperator):
                 self.dims_sizes(),
             ],
             "output_nodes": [reduce],
-        }
-        return block, attrs
-
-    def _generate_op_affine(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
-    ) -> tuple[Block, OpAttrs]:
-        """Emit matmul as nested affine.for over tensors (extract/insert + iter_args)."""
-        Ki, Kj, Kk, dtype, transpose_a, transpose_b = self.args
-        elt_type = {"float32": f32, "float64": f64}[dtype]
-        elt_size = {"float32": 32, "float64": 64}[dtype]
-
-        if self.op_type is not TensorType:
-            raise NotImplementedError(
-                "emit_affine matmul currently requires tensor dialect "
-                "(use_tensor_dialect=True); memref affine emission is not implemented yet"
-            )
-        if transpose_a or transpose_b:
-            raise NotImplementedError(
-                "emit_affine matmul does not support transposed layouts yet"
-            )
-
-        if block is None:
-            ops_types = [
-                TensorType(elt_type, shape)
-                for shape in [[Ki, Kk], [Kk, Kj], [Ki, Kj]]
-            ]
-            block = Block(arg_types=ops_types)
-            args = block.args
-        assert len(args) == 3
-        assert all(isinstance(arg.type, TensorType) for arg in args)
-
-        a, b, c_init = args
-        c_type = cast(TensorType, c_init.type)
-
-        map_a = AffineMap.from_callable(lambda i, j, k: (i, k))
-        map_b = AffineMap.from_callable(lambda i, j, k: (k, j))
-        map_c = AffineMap.from_callable(lambda i, j, k: (i, j))
-        map_c_2d = AffineMap.from_callable(lambda i, j: (i, j))
-
-        def affine_indices(amap: AffineMap, ivs: Sequence[SSAValue]) -> list[SSAValue]:
-            idxs: list[SSAValue] = []
-            for expr in amap.results:
-                proj = AffineMap(amap.num_dims, amap.num_symbols, (expr,))
-                idxs.append(
-                    affine.ApplyOp(ivs, AffineMapAttr(proj)).results[0]
-                )
-            return idxs
-
-        def affine_for(
-            upper: int,
-            init: SSAValue,
-            body_fn: Any,
-        ) -> affine.ForOp:
-            body = Block(arg_types=[IndexType(), c_type])
-            with ImplicitBuilder(body):
-                affine.YieldOp.get(body_fn(body.args[0], body.args[1]))
-            return affine.ForOp.from_region(
-                [],
-                [],
-                [init],
-                [c_type],
-                0,
-                upper,
-                Region([body]),
-                1,
-            )
-
-        with ImplicitBuilder(block):
-            cst0 = arith.ConstantOp(builtin.FloatAttr(0, elt_size))
-
-            def fill_i_body(i: SSAValue, c_i: SSAValue) -> SSAValue:
-                def fill_j_body(j: SSAValue, c_ij: SSAValue) -> SSAValue:
-                    return tensor.InsertOp(
-                        cst0.results[0],
-                        c_ij,
-                        affine_indices(map_c_2d, [i, j]),
-                    ).results[0]
-
-                return affine_for(Kj, c_i, fill_j_body).results[0]
-
-            fill = affine_for(Ki, c_init, fill_i_body)
-
-            def reduce_i_body(i: SSAValue, c_i: SSAValue) -> SSAValue:
-                def reduce_j_body(j: SSAValue, c_j: SSAValue) -> SSAValue:
-                    def reduce_k_body(k: SSAValue, c_cur: SSAValue) -> SSAValue:
-                        ivs = [i, j, k]
-                        va = tensor.ExtractOp(
-                            a, affine_indices(map_a, ivs), elt_type
-                        ).results[0]
-                        vb = tensor.ExtractOp(
-                            b, affine_indices(map_b, ivs), elt_type
-                        ).results[0]
-                        vc = tensor.ExtractOp(
-                            c_cur, affine_indices(map_c, ivs), elt_type
-                        ).results[0]
-                        mul = arith.MulfOp(va, vb)
-                        add = arith.AddfOp(vc, mul)
-                        return tensor.InsertOp(
-                            add.results[0],
-                            c_cur,
-                            affine_indices(map_c, ivs),
-                        ).results[0]
-
-                    return affine_for(Kk, c_j, reduce_k_body).results[0]
-
-                return affine_for(Kj, c_i, reduce_j_body).results[0]
-
-            reduce = affine_for(Ki, fill.results[0], reduce_i_body)
-
-        fill_node_id = f"{self.name}_0"
-        reduce_node_id = f"{self.name}"
-        fill.attributes[f"__xtc_id_{fill_node_id}_"] = UnitAttr()
-        reduce.attributes[f"__xtc_id_{reduce_node_id}_"] = UnitAttr()
-        # Empty nodes_map: affine nests are not linalg-tilable; skip transform dialect
-        # scheduling until affine-aware transforms exist.
-        attrs = {
-            "nodes_map": {},
-            "dims_sizes": [],
-            "output_nodes": [reduce],
+            "root_node": reduce_node_id,
         }
         return block, attrs
 
     @override
     def inputs_dims(self) -> tuple[tuple[int, ...], ...]:
-        i, j, k, _ = self.args
-        return (i, k), (k, j)
+        Ki, Kj, Kk, _, transpose_a, transpose_b = self.args
+        dims_a = (Kk, Ki) if transpose_a else (Ki, Kk)
+        dims_b = (Kj, Kk) if transpose_b else (Kk, Kj)
+        return dims_a, dims_b
 
     @override
     def inputs_types(self) -> tuple[str, ...]:
@@ -455,8 +384,69 @@ class MlirOperatorConv2D(MlirOperator):
 
     @override
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
+        use_emit = (
+            self.attrs.get("emit_from_desc")
+            or self.attrs.get("emit_affine")
+            or self.attrs.get("epilogue")
+        )
+        if use_emit:
+            _, _, _, _, _, _, _, dtype = self.args
+            SH, SW = self.attrs["stride"]
+            inps_dims = self.inputs_dims()
+            out_dims = self.outputs_dims()[0]
+            epilogue_body = resolve_epilogue(self.attrs.get("epilogue"), dtype)
+            emit_dialect = "affine" if self.attrs.get("emit_affine") else "linalg"
+
+            axis_sizes = self.dims_sizes()
+            axes = tuple(
+                Axis(name, axis_sizes[name], kind)
+                for name, kind in zip(self.AXES, self.KINDS)
+            )
+            op_desc = OpDesc(
+                name=self.name,
+                axes=axes,
+                inputs=(
+                    TensorDesc(
+                        "In",
+                        inps_dims[0],
+                        dtype,
+                        lambda b, h, w, f, r, s, c: (
+                            b,
+                            h * SH + r,
+                            w * SW + s,
+                            c,
+                        ),
+                    ),
+                    TensorDesc(
+                        "Wt",
+                        inps_dims[1],
+                        dtype,
+                        lambda b, h, w, f, r, s, c: (r, s, c, f),
+                    ),
+                ),
+                output=TensorDesc(
+                    "Out",
+                    out_dims,
+                    dtype,
+                    lambda b, h, w, f, r, s, c: (b, h, w, f),
+                ),
+                body=lambda input_elements, accumulator: arith.AddfOp(
+                    accumulator,
+                    arith.MulfOp(input_elements[0], input_elements[1]),
+                ).results[0],
+                init=0.0,
+                epilogue=epilogue_body,
+            )
+            return emit_op(
+                op_desc,
+                dialect=emit_dialect,
+                block=block,
+                args=args,
+                op_type=self.op_type,
+            )
+
         Kb, Kh, Kw, Kf, Kr, Ks, Kc, dtype = self.args
         SH, SW = self.attrs["stride"]
         inps_dims = self.inputs_dims()
@@ -542,6 +532,7 @@ class MlirOperatorConv2D(MlirOperator):
                 self.dims_sizes(),
             ],
             "output_nodes": [reduce],
+            "root_node": reduce_node_id,
         }
         return block, attrs
 
@@ -583,7 +574,7 @@ class MlirOperatorRelu(MlirOperator):
 
     @override
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
         Ki, dtype = self.args
         elt_type = {"float32": f32, "float64": f64}[dtype]
@@ -679,6 +670,7 @@ class MlirOperatorRelu(MlirOperator):
                 self.dims_sizes(),
             ],
             "output_nodes": [relu],
+            "root_node": relu_node_id,
         }
         return block, attrs
 
@@ -719,7 +711,7 @@ class MlirOperatorPad(MlirOperator):
 
     @override
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
         dtype = self.args[-1]
         dims_value = list(self.args[:-1])
@@ -872,6 +864,7 @@ class MlirOperatorPad(MlirOperator):
                 *([] if using_tensors else [self.dims_sizes()]),
             ],
             "output_nodes": [copy],
+            "root_node": copy_node_id,
         }
         return block, attrs
 
@@ -923,7 +916,7 @@ class MlirOperatorUnpad(MlirOperator):
 
     @override
     def generate_op(
-        self, block: Block | None = None, args: Sequence[BlockArgument] = []
+        self, block: Block | None = None, args: Sequence[BlockArgument] = ()
     ) -> tuple[Block, OpAttrs]:
         dtype = self.args[-1]
         dims_values = list(self.args[:-1])
@@ -984,6 +977,7 @@ class MlirOperatorUnpad(MlirOperator):
             },
             "dims_sizes": [*([] if using_tensors else [self.dims_sizes()])],
             "output_nodes": [copy],
+            "root_node": copy_node_id,
         }
         return block, attrs
 
