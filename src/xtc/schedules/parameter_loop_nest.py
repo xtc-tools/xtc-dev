@@ -631,10 +631,14 @@ class ParameterLoopNest:
                 ):
                     raise ScheduleValidationError(f"{gpu_name} need to be a tile")
             # We need to check if there is a loop above the generated kernel
-            for prim in gpu_block_set:
+            for i, prim in enumerate(gpu_block_set):
                 if sched.interchange.index(prim) >= len(gpu_block_set):
                     raise ScheduleValidationError(
                         "gpu_block needs to be in the most outermost loop"
+                    )
+                elif sched.interchange[i] != prim:
+                    raise ScheduleValidationError(
+                        "gpu_block does not reflect the reference order of interchange"
                     )
 
     @staticmethod
