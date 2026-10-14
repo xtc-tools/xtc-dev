@@ -647,7 +647,7 @@ class MlirProgramInsertTransformPass:
         new_loop = tiling_command.results[-1]
         sched_state.all_loops[loop_name] = new_loop
         if loop_name in schedule.gpu_blocks:
-            loop_name = schedule.gpu_blocks[0]
+            loop_name = schedule.gpu_blocks[-1]
         # Annotate the resulting loop if successfully generated
         transform.AnnotateOp(new_loop, loop_name)
 
