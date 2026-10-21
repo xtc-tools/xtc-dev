@@ -476,9 +476,14 @@ class MlirProgramInsertTransformPass:
         unscheduled_handles.add(consumer_id)
         # fuse consumer into all loops until the fuse axis
         fuse_loops = []
+        fuse_loop_dims = []
         for loop_dim in schedule.permutation[fuse_root]:
+            # gpu_blocks turn into one combined forall annotated with the innermost dim
+            if loop_dim in schedule.gpu_blocks and loop_dim != schedule.gpu_blocks[-1]:
+                continue
             transform_result = sched_state.all_loops[loop_dim]
             fuse_loops.append(transform_result)
+            fuse_loop_dims.append(loop_dim)
             if loop_dim == fuse_axis:
                 break
         consumer_handle = structured_match(
@@ -488,7 +493,7 @@ class MlirProgramInsertTransformPass:
         )
         op = xtc_transform.FuseConsumerOp(consumer_handle, fuse_loops, in_place=True)
         # re-annotate the loops that were touched by the fusion
-        for i, loop_dim in enumerate(schedule.permutation[fuse_root]):
+        for i, loop_dim in enumerate(fuse_loop_dims):
             sched_state.all_loops[loop_dim] = op.new_loops[i]
             transform.AnnotateOp(op.new_loops[i], loop_dim)
             if loop_dim == fuse_axis:
@@ -503,6 +508,10 @@ class MlirProgramInsertTransformPass:
     ):
         assert self._named_sequence is not None
         target_container = sched_state.prev_container
+
+        # gpu_blocks turn into one combined forall annotated with the innermost dim
+        if loop_name in schedule.gpu_blocks and loop_name != schedule.gpu_blocks[-1]:
+            return
 
         fuse_op_names = fuse_axes[loop_name]
         for fuse_op_name in fuse_op_names:
@@ -645,9 +654,9 @@ class MlirProgramInsertTransformPass:
         sched_state.handle = tiling_command.results[0]
         assert len(tiling_command.results) == 2
         new_loop = tiling_command.results[-1]
-        sched_state.all_loops[loop_name] = new_loop
         if loop_name in schedule.gpu_blocks:
             loop_name = schedule.gpu_blocks[-1]
+        sched_state.all_loops[loop_name] = new_loop
         # Annotate the resulting loop if successfully generated
         transform.AnnotateOp(new_loop, loop_name)
 
