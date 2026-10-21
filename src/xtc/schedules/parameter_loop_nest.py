@@ -597,6 +597,20 @@ class ParameterLoopNest:
                 "gpu_warp": set(sched.gpu_warp.keys()),
             }
 
+            has_block = bool(sched.gpu_block)
+            has_thread_or_lane_or_warp = (
+                bool(sched.gpu_thread) or bool(sched.gpu_lane) or bool(sched.gpu_warp)
+            )
+            if not has_block and has_thread_or_lane_or_warp:
+                raise ScheduleValidationError(
+                    "gpu_block needs to be specified for either gpu_thread, gpu_lane or gpu_warp."
+                )
+            gpu_block_set = gpu_sets["gpu_block"]
+            if not all(prim in info.dims for prim in gpu_block_set):
+                raise ScheduleValidationError(
+                    "gpu_block must only contain axes, not tiles"
+                )
+
             primitive_names = list(gpu_sets.keys())
             for prim1, prim2 in combinations(primitive_names, 2):
                 overlap = gpu_sets[prim1] & gpu_sets[prim2]
@@ -606,39 +620,21 @@ class ParameterLoopNest:
                         f"Loops {loops_str} appear in both {prim1} and {prim2}."
                     )
 
-            has_block = bool(sched.gpu_block)
-            has_thread_or_lane_or_warp = (
-                bool(sched.gpu_thread) or bool(sched.gpu_lane) or bool(sched.gpu_warp)
-            )
-            if not has_block and has_thread_or_lane_or_warp:
-                raise ScheduleValidationError(
-                    "Need gpu_block to be specified for either gpu_thread or gpu_lane or gpu_warp."
-                )
-            if not has_block and has_thread_or_lane_or_warp:
-                raise ScheduleValidationError(
-                    "Need gpu_block to be specified for either gpu_thread or gpu_lane or gpu_warp."
-                )
-            gpu_block_set = gpu_sets["gpu_block"]
-            if not all(prim in info.dims for prim in gpu_block_set):
-                raise ScheduleValidationError(
-                    "Need gpu_block to be an axis and not a tile"
-                )
-
             for gpu_name in primitive_names[1:]:
                 if not all(
                     info.tiles_to_axis.get(prim, None) is not None
                     for prim in gpu_sets[gpu_name]
                 ):
-                    raise ScheduleValidationError(f"{gpu_name} need to be a tile")
+                    raise ScheduleValidationError(f"{gpu_name} needs to be a tile")
             # We need to check if there is a loop above the generated kernel
             for i, prim in enumerate(gpu_block_set):
                 if sched.interchange.index(prim) >= len(gpu_block_set):
                     raise ScheduleValidationError(
-                        "gpu_block needs to be in the most outermost loop"
+                        "gpu_block must contain the outermost loop"
                     )
                 elif sched.interchange[i] != prim:
                     raise ScheduleValidationError(
-                        "gpu_block does not reflect the reference order of interchange"
+                        "gpu_block order does not reflect the reference order of interchange"
                     )
 
     @staticmethod
