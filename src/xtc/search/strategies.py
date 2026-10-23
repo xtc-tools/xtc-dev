@@ -1048,6 +1048,8 @@ class Strategy_GOTO(BaseStrategy):
     def _filter(self, samples: Iterator[VecSample]) -> Iterator[VecSample]:
         v_index = 3
         indexes = [1, 3, 5]
+        # k1 has kL1 iterations, its unroll factor must not exceed them
+        samples = (x for x in samples if x[5] <= x[4])
         samples = self._filter_unroll(indexes, v_index, samples, stat="filtered")
         return samples
 
@@ -1060,7 +1062,7 @@ class Strategy_GOTO(BaseStrategy):
         if opt_level >= 3:
             jtile = self._vec_size
             itile = 2  # TODO: IPC?
-            ktile = 1
+            ktile = 2  # must be >= the k1 unroll factor
             idiv = i >= itile and i % itile == 0
             jdiv = j >= jtile and j % jtile == 0
             kdiv = k >= ktile and k % ktile == 0
