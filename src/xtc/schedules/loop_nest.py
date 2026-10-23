@@ -387,6 +387,7 @@ class LoopNest:
         self._check_tiling_consistency(info)
         self._check_sizes(info)
         self._check_gpu_consistency(info)
+        self._check_fusion_consistency(info)
 
     def _check_use_defined_dims(self, info: LoopInfo):
         for dim in self.abstract_dims:
@@ -556,6 +557,12 @@ class LoopNest:
                     raise ScheduleValidationError(
                         "gpu_block order does not reflect the reference order of interchange"
                     )
+
+    def _check_fusion_consistency(self, info: LoopInfo) -> None:
+        if any(s.fuse_producer_at or s.fuse_consumer_at for s in self.nodes[1:]):
+            raise ScheduleValidationError(
+                "Fusion must be to an axis in the base root not the result of a split."
+            )
 
     @staticmethod
     def _must_be_smaller_routine(
